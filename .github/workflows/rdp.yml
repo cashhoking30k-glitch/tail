@@ -1,0 +1,195 @@
+name: RDP (Auto-Save/Restore)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Previous Session Backup
+        continue-on-error: true
+        run: |
+          Write-Host "Checking for previous session backup..."
+          $artifacts = gh api repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[] | select(.name == "rdp-session-backup") | .id' | Select-Object -First 1
+          if ($artifacts) {
+              Write-Host "Found backup artifact, downloading..."
+              gh api repos/${{ github.repository }}/actions/artifacts/$artifacts/zip > backup.zip
+              if (Test-Path backup.zip) {
+                  Expand-Archive -Path backup.zip -DestinationPath C:\RestoreData -Force
+                  Write-Host "Backup downloaded and extracted"
+                  if (Test-Path "C:\RestoreData\Desktop") {
+                      Copy-Item -Path "C:\RestoreData\Desktop\*" -Destination "$env:USERPROFILE\Desktop" -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Desktop restored"
+                  }
+                  if (Test-Path "C:\RestoreData\Documents") {
+                      Copy-Item -Path "C:\RestoreData\Documents\*" -Destination "$env:USERPROFILE\Documents" -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Documents restored"
+                  }
+                  if (Test-Path "C:\RestoreData\Downloads") {
+                      Copy-Item -Path "C:\RestoreData\Downloads\*" -Destination "$env:USERPROFILE\Downloads" -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Downloads restored"
+                  }
+                  if (Test-Path "C:\RestoreData\Work") {
+                      New-Item -Path "C:\Work" -ItemType Directory -Force | Out-Null
+                      Copy-Item -Path "C:\RestoreData\Work\*" -Destination "C:\Work" -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Work directory restored"
+                  }
+                  if (Test-Path "C:\RestoreData\ChromeData") {
+                      $chromeDataPath = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+                      New-Item -Path $chromeDataPath -ItemType Directory -Force | Out-Null
+                      Copy-Item -Path "C:\RestoreData\ChromeData\*" -Destination $chromeDataPath -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Chrome data restored"
+                  }
+                  if (Test-Path "C:\RestoreData\EdgeData") {
+                      $edgeDataPath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
+                      New-Item -Path $edgeDataPath -ItemType Directory -Force | Out-Null
+                      Copy-Item -Path "C:\RestoreData\EdgeData\*" -Destination $edgeDataPath -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Edge data restored"
+                  }
+                  if (Test-Path "C:\RestoreData\FirefoxData") {
+                      $firefoxDataPath = "$env:APPDATA\Mozilla\Firefox"
+                      New-Item -Path $firefoxDataPath -ItemType Directory -Force | Out-Null
+                      Copy-Item -Path "C:\RestoreData\FirefoxData\*" -Destination $firefoxDataPath -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Firefox data restored"
+                  }
+                  Remove-Item backup.zip -Force
+              }
+          } else {
+              Write-Host "No previous backup found"
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          $password = "Lilrodney12@"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "HACKER999" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "HACKER999"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "HACKER999"
+          echo "RDP_CREDS=User: HACKER999 | Password: $password" >> $env:GITHUB_ENV
+          if (-not (Get-LocalUser -Name "HACKER999")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Set-Content -Path "tailscale_ip.txt" -Value $tsIP
+
+      - name: Upload Tailscale IP as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-ip
+          path: tailscale_ip.txt
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful"
+
+      - name: Setup Auto-Backup Task
+        run: |
+          New-Item -Path "C:\BackupTemp" -ItemType Directory -Force | Out-Null
+          
+          $lines = @()
+          $lines += '$bp = "C:\BackupTemp\Session"'
+          $lines += 'New-Item -Path $bp -ItemType Directory -Force | Out-Null'
+          $lines += 'if (Test-Path "$env:USERPROFILE\Desktop") { Copy-Item -Path "$env:USERPROFILE\Desktop" -Destination "$bp\Desktop" -Recurse -Force -ErrorAction SilentlyContinue }'
+          $lines += 'if (Test-Path "$env:USERPROFILE\Documents") { Copy-Item -Path "$env:USERPROFILE\Documents" -Destination "$bp\Documents" -Recurse -Force -ErrorAction SilentlyContinue }'
+          $lines += 'if (Test-Path "$env:USERPROFILE\Downloads") { Copy-Item -Path "$env:USERPROFILE\Downloads" -Destination "$bp\Downloads" -Recurse -Force -ErrorAction SilentlyContinue }'
+          $lines += 'if (Test-Path "C:\Work") { Copy-Item -Path "C:\Work" -Destination "$bp\Work" -Recurse -Force -ErrorAction SilentlyContinue }'
+          $lines += '$cp = "$env:LOCALAPPDATA\Google\Chrome\User Data"'
+          $lines += 'if (Test-Path $cp) { New-Item -Path "$bp\ChromeData" -ItemType Directory -Force | Out-Null; $files = @("Default\Bookmarks","Default\History","Default\Login Data","Default\Preferences","Default\Sessions","Default\Current Session","Default\Last Session","Default\Cookies","Default\Web Data","Local State"); foreach ($f in $files) { $s = Join-Path $cp $f; if (Test-Path $s) { $d = Split-Path (Join-Path "$bp\ChromeData" $f); New-Item -Path $d -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null; Copy-Item -Path $s -Destination (Join-Path "$bp\ChromeData" $f) -Force -ErrorAction SilentlyContinue } } }'
+          $lines += '$ep = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"'
+          $lines += 'if (Test-Path $ep) { New-Item -Path "$bp\EdgeData" -ItemType Directory -Force | Out-Null; $files = @("Default\Bookmarks","Default\History","Default\Login Data","Default\Preferences","Default\Sessions","Default\Current Session","Default\Last Session","Default\Cookies","Default\Web Data","Local State"); foreach ($f in $files) { $s = Join-Path $ep $f; if (Test-Path $s) { $d = Split-Path (Join-Path "$bp\EdgeData" $f); New-Item -Path $d -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null; Copy-Item -Path $s -Destination (Join-Path "$bp\EdgeData" $f) -Force -ErrorAction SilentlyContinue } } }'
+          $lines += '$fp = "$env:APPDATA\Mozilla\Firefox"'
+          $lines += 'if (Test-Path $fp) { Copy-Item -Path $fp -Destination "$bp\FirefoxData" -Recurse -Force -ErrorAction SilentlyContinue }'
+          $lines += 'Write-Host "Backup completed"'
+          
+          $script = $lines -join "`n"
+          Set-Content -Path "C:\BackupTemp\backup.ps1" -Value $script
+          
+          Write-Host "Running initial backup..."
+          & powershell.exe -NoProfile -File "C:\BackupTemp\backup.ps1"
+          Write-Host "Initial backup completed"
+          
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -File C:\BackupTemp\backup.ps1"
+          $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(30) -RepetitionInterval (New-TimeSpan -Minutes 30)
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          Register-ScheduledTask -TaskName "RDP-AutoBackup" -Action $action -Trigger $trigger -Principal $principal -Force
+          Write-Host "Auto-backup scheduled for every 30 minutes"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Own by cash.250k"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: HACKER999"
+          Write-Host "Password: Lilrodney12@"
+          Write-Host "Auto-backup: Every 30 minutes"
+          Write-Host "==================`n"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Final Backup Before Shutdown
+        if: always()
+        run: |
+          Write-Host "Creating final backup..."
+          if (Get-ScheduledTask -TaskName "RDP-AutoBackup" -ErrorAction SilentlyContinue) {
+              Start-ScheduledTask -TaskName "RDP-AutoBackup"
+              Start-Sleep -Seconds 15
+          }
+          Write-Host "Final backup completed"
+
+      - name: Upload Session Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-session-backup
+          path: C:\BackupTemp\Session\
+          retention-days: 7
+          compression-level: 9
